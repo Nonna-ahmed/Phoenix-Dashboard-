@@ -42,6 +42,7 @@ def load_shelters():
     # Real OSM data: schools, mosques, health facilities, fire stations,
     # and declared emergency shelters across North-East Algeria.
     df = pd.read_csv("north_algeria_shelters.csv")
+    df = df.drop(columns=["capacity"])  # raw OSM 'capacity' tag (mostly empty) — drop to avoid name clash
     df = df.rename(columns={"capacity_estimate": "capacity", "display_name": "name"})
     df["capacity"] = df["capacity"].fillna(25).astype(int)
     # Health facilities & fire stations are SUPPORT resources, not evacuee
