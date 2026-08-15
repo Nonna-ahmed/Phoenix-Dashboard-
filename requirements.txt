@@ -3,3 +3,4 @@ folium
 streamlit-folium
 xgboost
 pandas
+scikit-learn
