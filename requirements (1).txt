@@ -1,4 +1,4 @@
-streamlit
+sstreamlit
 folium
 streamlit-folium
 xgboost
