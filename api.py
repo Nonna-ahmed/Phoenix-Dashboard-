@@ -29,6 +29,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from phoenix_predict import predict_fire_risk
+from risk_engine import get_alert
+from air_quality import fetch_live_pm25
 
 # -----------------------------------------------------------------
 # App & data loading (runs once on startup)
@@ -40,6 +42,7 @@ app = FastAPI(
 )
 
 CLIMATE_DF = pd.read_csv("phoenix_climate_engineered.csv", parse_dates=["date"])
+TODAY = pd.Timestamp.now().normalize()
 
 SHELTERS_DF = pd.read_csv("north_algeria_shelters.csv")
 SHELTERS_DF = SHELTERS_DF.drop(columns=["capacity", "name"])  # drop raw OSM tags (mostly empty / cause name clash)
@@ -49,6 +52,16 @@ SHELTERS_DF["capacity"] = pd.to_numeric(SHELTERS_DF["capacity"], errors="coerce"
 SHELTERS_DF["capacity_source"] = SHELTERS_DF["capacity_source"].fillna("unknown")
 SHELTERS_DF["is_shelter"] = SHELTERS_DF["capacity_source"] != "default_estimate_non_shelter"
 SHELTERS_DF["available"] = SHELTERS_DF["capacity"]  # no live occupancy feed yet
+
+# Merge REAL current air-quality readings (Open-Meteo, per shelter location).
+# This is a live snapshot, not tied to any specific historical date.
+try:
+    AQI_DF = pd.read_csv("shelters_with_air_quality.csv")[["osm_id", "pm2_5", "us_aqi", "observation_time"]]
+    SHELTERS_DF = SHELTERS_DF.merge(AQI_DF, on="osm_id", how="left")
+except FileNotFoundError:
+    SHELTERS_DF["pm2_5"] = None
+    SHELTERS_DF["us_aqi"] = None
+    SHELTERS_DF["observation_time"] = None
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -86,6 +99,9 @@ class ShelterOut(BaseModel):
     capacity: int
     available: int
     is_shelter: bool
+    pm2_5: Optional[float] = None
+    us_aqi: Optional[float] = None
+    observation_time: Optional[str] = None
 
 
 class NearestShelterResponse(BaseModel):
@@ -128,11 +144,14 @@ def predict(req: PredictRequest):
 
 @app.get("/risk-map", response_model=List[dict])
 def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12")):
-    """Return fire risk for every grid cell in the region on a given date."""
+    """Return fire risk for every grid cell in the region on a given date.
+    Health/air-quality fields are only populated for TODAY (live data source);
+    historical dates return null health fields with a note."""
     day_data = CLIMATE_DF[CLIMATE_DF["date"] == pd.Timestamp(date)]
     if day_data.empty:
         raise HTTPException(status_code=404, detail="No climate data available for this date.")
 
+    is_today = pd.Timestamp(date).normalize() == TODAY
     doy = pd.Timestamp(date).dayofyear
     results = []
     for _, row in day_data.iterrows():
@@ -141,7 +160,15 @@ def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 20
             t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
             rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
         )
-        results.append({"lat": row["LAT"], "lon": row["LON"], **r})
+        entry = {"lat": row["LAT"], "lon": row["LON"], **r,
+                  "pm2_5": None, "health_level": None, "health_advice": None}
+        if is_today:
+            pm25 = fetch_live_pm25(row["LAT"], row["LON"])
+            if pm25 is not None:
+                alert = get_alert(r["fire_probability"], pm25)
+                entry.update({"pm2_5": pm25, "health_level": alert.health_level,
+                               "health_advice": alert.health_advice})
+        results.append(entry)
     return results
 
 
@@ -155,7 +182,9 @@ def list_shelters(
         df = df[df["category"] == category]
     if only_shelters:
         df = df[df["is_shelter"]]
-    return df[["osm_id", "category", "name", "lat", "lon", "capacity", "available", "is_shelter"]].to_dict(orient="records")
+    cols = ["osm_id", "category", "name", "lat", "lon", "capacity", "available", "is_shelter",
+            "pm2_5", "us_aqi", "observation_time"]
+    return df[cols].to_dict(orient="records")
 
 
 @app.get("/shelters/nearest", response_model=NearestShelterResponse)
@@ -198,6 +227,10 @@ def alerts(date: date_type = Query(..., description="Date to evaluate, e.g. 2026
             nearest = shelters.loc[shelters["distance_km"].idxmin()]
             nearest_name, nearest_dist = nearest["name"], round(nearest["distance_km"], 2)
 
+        health_note = ""
+        if z.get("health_advice"):
+            health_note = f" {z['health_advice']}"
+
         out.append({
             "lat": z["lat"], "lon": z["lon"],
             "fire_probability": z["fire_probability"], "risk_level": z["risk_level"],
@@ -206,6 +239,7 @@ def alerts(date: date_type = Query(..., description="Date to evaluate, e.g. 2026
                 f"[ALERT] High wildfire risk near ({z['lat']}, {z['lon']}). "
                 f"Probability: {z['fire_probability']*100:.0f}%. "
                 + (f"Nearest shelter: {nearest_name} ({nearest_dist} km)." if nearest_name else "No nearby shelter capacity found.")
+                + health_note
             ),
         })
     return out
